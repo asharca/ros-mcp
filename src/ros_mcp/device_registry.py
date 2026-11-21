@@ -14,7 +14,6 @@ from pydantic import SecretStr, ValidationError
 
 from .models import (
     DEVICE_ID_PATTERN,
-    AuthType,
     DeviceConfig,
     DeviceListResult,
     PasswordAuthConfig,
@@ -61,7 +60,10 @@ class DeviceRegistry:
         cls,
         environ: Mapping[str, str] | None = None,
     ) -> DeviceRegistry:
-        """Load from an explicit environment mapping, or a snapshot of ``os.environ``."""
+        """Load from an explicit environment mapping, or a snapshot of ``os.environ``.
+
+        Relative ``private_key_file`` paths resolve against the working directory.
+        """
 
         environment = dict(os.environ if environ is None else environ)
         raw_devices = environment.get(DEVICES_ENV_VAR)
@@ -70,7 +72,7 @@ class DeviceRegistry:
         if not isinstance(raw_devices, str) or not raw_devices.strip():
             raise DeviceRegistryError(f"required environment variable {DEVICES_ENV_VAR} is empty")
 
-        return cls._from_json(raw_devices, environment, source=DEVICES_ENV_VAR)
+        return cls._from_json(raw_devices, environment, source=DEVICES_ENV_VAR, base_dir=None)
 
     @classmethod
     def from_file(
@@ -78,7 +80,10 @@ class DeviceRegistry:
         path: str | Path,
         environ: Mapping[str, str] | None = None,
     ) -> DeviceRegistry:
-        """Load a device registry file and resolve its secret references from the environment."""
+        """Load a device registry file and resolve its secret references.
+
+        Relative ``private_key_file`` paths resolve against the configuration file's directory.
+        """
 
         environment = dict(os.environ if environ is None else environ)
         if DEVICES_ENV_VAR in environment:
@@ -105,6 +110,7 @@ class DeviceRegistry:
             raw_devices,
             environment,
             source=f"configuration file {config_path!s}",
+            base_dir=config_path.parent,
         )
 
     @classmethod
@@ -114,6 +120,7 @@ class DeviceRegistry:
         environment: Mapping[str, str],
         *,
         source: str,
+        base_dir: Path | None,
     ) -> DeviceRegistry:
         """Validate a JSON device registry and resolve its secret references."""
 
@@ -157,7 +164,7 @@ class DeviceRegistry:
                     or "configuration"
                 )
             else:
-                resolved[device_id] = cls._resolve_device(device_id, config, environment)
+                resolved[device_id] = _resolve_device(device_id, config, environment, base_dir)
                 continue
 
             raise DeviceRegistryError(
@@ -165,96 +172,6 @@ class DeviceRegistry:
             )
 
         return cls(resolved)
-
-    @staticmethod
-    def _resolve_secret(
-        environment: Mapping[str, str],
-        variable_name: str,
-        *,
-        device_id: str,
-        secret_kind: str,
-    ) -> SecretStr:
-        if variable_name not in environment:
-            raise DeviceRegistryError(
-                f"device {device_id!r} references a missing {secret_kind} environment variable"
-            )
-        value = environment[variable_name]
-        if not isinstance(value, str) or not value.strip():
-            raise DeviceRegistryError(f"device {device_id!r} has an empty {secret_kind}")
-        return SecretStr(value)
-
-    @classmethod
-    def _resolve_device(
-        cls,
-        device_id: str,
-        config: DeviceConfig,
-        environment: Mapping[str, str],
-    ) -> ResolvedDevice:
-        password: SecretStr | None = None
-        private_key: SecretStr | None = None
-        passphrase: SecretStr | None = None
-
-        if isinstance(config.auth, PasswordAuthConfig):
-            auth_type = AuthType.PASSWORD
-            if config.auth.password is not None:
-                password = config.auth.password
-            else:
-                assert config.auth.password_env is not None
-                password = cls._resolve_secret(
-                    environment,
-                    config.auth.password_env,
-                    device_id=device_id,
-                    secret_kind="password",
-                )
-        else:
-            auth_type = AuthType.PRIVATE_KEY
-            private_key = cls._resolve_secret(
-                environment,
-                config.auth.private_key_env,
-                device_id=device_id,
-                secret_kind="private key",
-            )
-            private_key_lines = private_key.get_secret_value().strip().splitlines()
-            first_line = private_key_lines[0]
-            if not (
-                first_line.startswith("-----BEGIN ") and first_line.endswith("PRIVATE KEY-----")
-            ):
-                raise DeviceRegistryError(
-                    f"device {device_id!r} private key must contain complete PEM/OpenSSH key text"
-                )
-            expected_end = first_line.replace("-----BEGIN ", "-----END ", 1)
-            if private_key_lines[-1] != expected_end:
-                raise DeviceRegistryError(
-                    f"device {device_id!r} private key must contain complete PEM/OpenSSH key text"
-                )
-            if config.auth.passphrase_env is not None:
-                passphrase = cls._resolve_secret(
-                    environment,
-                    config.auth.passphrase_env,
-                    device_id=device_id,
-                    secret_kind="private-key passphrase",
-                )
-
-        return ResolvedDevice(
-            device=device_id,
-            display_name=config.display_name or device_id,
-            description=config.description,
-            host=config.host,
-            port=config.port,
-            username=config.username,
-            auth_type=auth_type,
-            enabled=config.enabled,
-            tags=config.tags,
-            connect_timeout_seconds=config.connect_timeout_seconds,
-            command_timeout_seconds=config.command_timeout_seconds,
-            keepalive_seconds=config.keepalive_seconds,
-            idle_ttl_seconds=config.idle_ttl_seconds,
-            output_limit_bytes=config.output_limit_bytes,
-            password=password,
-            private_key=private_key,
-            passphrase=passphrase,
-            fingerprint_sha256=config.host_key.fingerprint_sha256,
-        )
 
     def get(self, device_id: str) -> ResolvedDevice:
         try:
@@ -264,7 +181,7 @@ class DeviceRegistry:
 
     def list_devices(self) -> DeviceListResult:
         return DeviceListResult(
-            devices=tuple(device.to_summary() for device in self._devices.values())
+            devices=tuple(device.summary() for device in self._devices.values())
         )
 
     @property
@@ -276,3 +193,83 @@ class DeviceRegistry:
 
     def __len__(self) -> int:
         return len(self._devices)
+
+
+def _resolve_device(
+    device_id: str,
+    config: DeviceConfig,
+    environment: Mapping[str, str],
+    base_dir: Path | None,
+) -> ResolvedDevice:
+    auth = config.auth
+    if isinstance(auth, PasswordAuthConfig):
+        password = auth.password
+        if password is None:
+            assert auth.password_env is not None
+            password = _resolve_secret(environment, auth.password_env, device_id, "password")
+        return ResolvedDevice(device=device_id, config=config, password=password)
+
+    if auth.private_key_file is not None:
+        private_key = _read_private_key_file(device_id, auth.private_key_file, base_dir)
+    else:
+        assert auth.private_key_env is not None
+        private_key = _resolve_secret(environment, auth.private_key_env, device_id, "private key")
+    _require_complete_private_key(device_id, private_key)
+
+    passphrase = None
+    if auth.passphrase_env is not None:
+        passphrase = _resolve_secret(
+            environment, auth.passphrase_env, device_id, "private-key passphrase"
+        )
+    return ResolvedDevice(
+        device=device_id,
+        config=config,
+        private_key=private_key,
+        passphrase=passphrase,
+    )
+
+
+def _resolve_secret(
+    environment: Mapping[str, str],
+    variable_name: str,
+    device_id: str,
+    secret_kind: str,
+) -> SecretStr:
+    if variable_name not in environment:
+        raise DeviceRegistryError(
+            f"device {device_id!r} references a missing {secret_kind} environment variable"
+        )
+    value = environment[variable_name]
+    if not isinstance(value, str) or not value.strip():
+        raise DeviceRegistryError(f"device {device_id!r} has an empty {secret_kind}")
+    return SecretStr(value)
+
+
+def _read_private_key_file(device_id: str, path_text: str, base_dir: Path | None) -> SecretStr:
+    path = Path(path_text)
+    if base_dir is not None and not path.is_absolute():
+        path = base_dir / path
+    read_error: DeviceRegistryError | None = None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        read_error = DeviceRegistryError(f"device {device_id!r} private key file cannot be read")
+    if read_error is not None:
+        raise read_error
+    if not text.strip():
+        raise DeviceRegistryError(f"device {device_id!r} has an empty private key")
+    return SecretStr(text)
+
+
+def _require_complete_private_key(device_id: str, private_key: SecretStr) -> None:
+    lines = private_key.get_secret_value().strip().splitlines()
+    first_line = lines[0]
+    complete = (
+        first_line.startswith("-----BEGIN ")
+        and first_line.endswith("PRIVATE KEY-----")
+        and lines[-1] == first_line.replace("-----BEGIN ", "-----END ", 1)
+    )
+    if not complete:
+        raise DeviceRegistryError(
+            f"device {device_id!r} private key must contain complete PEM/OpenSSH key text"
+        )

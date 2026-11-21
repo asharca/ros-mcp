@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from ros_mcp.device_registry import DeviceNotFoundError, DeviceRegistry, DeviceRegistryError
-from ros_mcp.models import AuthType, DeviceConfig
+from ros_mcp.models import DeviceConfig, PrivateKeyAuthConfig
 
 FINGERPRINT_A = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 FINGERPRINT_B = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"
@@ -69,8 +69,8 @@ def test_loads_multiple_devices_with_independent_passwords() -> None:
     assert registry.get("office").password is not None
     assert registry.get("main").password.get_secret_value() == "main-secret"
     assert registry.get("office").password.get_secret_value() == "office-secret"
-    assert registry.get("main").display_name == "Main Router"
-    assert registry.get("office").display_name == "office"
+    assert registry.get("main").summary().display_name == "Main Router"
+    assert registry.get("office").summary().display_name == "office"
 
 
 def test_loads_devices_from_a_configuration_file(tmp_path: Path) -> None:
@@ -145,11 +145,54 @@ def test_resolves_complete_private_key_and_optional_passphrase() -> None:
     )
 
     resolved = registry.get("main")
-    assert resolved.auth_type is AuthType.PRIVATE_KEY
+    assert isinstance(resolved.config.auth, PrivateKeyAuthConfig)
     assert resolved.private_key is not None
     assert resolved.private_key.get_secret_value() == private_key
     assert resolved.passphrase is not None
     assert resolved.passphrase.get_secret_value() == "key-secret"
+
+
+def test_reads_a_private_key_file_relative_to_the_configuration_file(tmp_path: Path) -> None:
+    private_key = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nkey-data\n-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "keys" / "main").write_text(private_key, encoding="utf-8")
+    device = {
+        "host": "192.0.2.1",
+        "username": "ai-mgmt",
+        "auth": {"type": "private_key", "private_key_file": "keys/main"},
+        "host_key": {"fingerprint_sha256": FINGERPRINT_A},
+    }
+
+    registry = DeviceRegistry.from_file(write_config_file(tmp_path, {"main": device}), {})
+
+    resolved = registry.get("main")
+    assert resolved.private_key is not None
+    assert resolved.private_key.get_secret_value() == private_key
+    assert "key-data" not in repr(resolved)
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"type": "private_key", "private_key_file": "missing"},
+        {"type": "private_key", "private_key_file": "x", "private_key_env": "KEY"},
+        {"type": "private_key"},
+    ],
+)
+def test_rejects_invalid_private_key_file_configuration(
+    tmp_path: Path, auth: dict[str, str]
+) -> None:
+    device = {
+        "host": "192.0.2.1",
+        "username": "ai-mgmt",
+        "auth": auth,
+        "host_key": {"fingerprint_sha256": FINGERPRINT_A},
+    }
+
+    with pytest.raises(DeviceRegistryError):
+        DeviceRegistry.from_file(write_config_file(tmp_path, {"main": device}), {"KEY": "x"})
 
 
 def test_public_summary_and_resolved_dump_do_not_leak_sensitive_data() -> None:
@@ -162,13 +205,12 @@ def test_public_summary_and_resolved_dump_do_not_leak_sensitive_data() -> None:
     )
 
     summary_json = registry.list_devices().model_dump_json()
-    resolved_json = registry.get("main").model_dump_json()
+    resolved_json = repr(registry.get("main"))
     combined = summary_json + resolved_json
 
     assert "highly-sensitive-password" not in combined
     assert "MAIN_PASSWORD" not in combined
     assert fingerprint not in combined
-    assert "password" in summary_json
     assert "192.0.2.1" in summary_json
 
 
@@ -181,7 +223,7 @@ def test_inline_password_does_not_leak_from_registry_outputs(tmp_path: Path) -> 
         {},
     )
 
-    combined = registry.list_devices().model_dump_json() + registry.get("main").model_dump_json()
+    combined = registry.list_devices().model_dump_json() + repr(registry.get("main"))
 
     assert secret not in config_json
     assert secret not in combined

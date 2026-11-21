@@ -5,38 +5,36 @@ from __future__ import annotations
 import asyncio
 import hmac
 import io
-import socket
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import Any, Protocol
 
 import paramiko
 
-if TYPE_CHECKING:
-    from ros_mcp.models import ResolvedDevice
+from ros_mcp.models import PasswordAuthConfig, ResolvedDevice
 
-
-ExecutionStatus = Literal["succeeded", "failed", "unknown"]
-ExecutionState = Literal["completed", "unknown"]
+TAIL_BYTES = 1024
+_RECV_BYTES = 32 * 1024
 
 
 @dataclass(frozen=True, slots=True)
 class SSHExecution:
-    """Result of a command whose dispatch outcome is known or explicitly unknown."""
+    """Output of a dispatched command.
 
-    status: ExecutionStatus
-    execution_state: ExecutionState
+    ``completed`` is False when the command was dispatched but the SSH session failed or
+    timed out before it finished: the command may or may not have taken effect.
+    """
+
+    completed: bool
     exit_code: int | None
-    stdout: str
-    stderr: str
-    stdout_total_bytes: int
-    stderr_total_bytes: int
-    stdout_truncated: bool
-    stderr_truncated: bool
-    error_code: str | None = None
-    error_message: str | None = None
+    output: bytes
+    """stdout and stderr combined, up to the output limit."""
+    tail: bytes
+    """The last ``TAIL_BYTES`` of the output, kept even when ``output`` is truncated."""
+    truncated: bool
+    timed_out: bool = False
 
 
 class SSHAdapterError(RuntimeError):
@@ -47,11 +45,16 @@ class SSHAdapterError(RuntimeError):
         self.code = code
         self.message = message
         self.retryable = retryable
-        self.may_have_executed = False
 
 
 class SSHCommandPort(Protocol):
-    async def execute(self, device: ResolvedDevice, command: str) -> SSHExecution: ...
+    async def execute(
+        self,
+        device: ResolvedDevice,
+        command: str,
+        *,
+        output_limit_bytes: int | None = None,
+    ) -> SSHExecution: ...
 
     async def aclose(self) -> None: ...
 
@@ -65,7 +68,7 @@ class _PrivateKeyLoadError(paramiko.SSHException):
 
 
 class _FingerprintPolicy(paramiko.MissingHostKeyPolicy):
-    """Accept exactly one configured SHA256 host-key fingerprint."""
+    """Accept exactly one configured SHA256 host-key fingerprint, before authentication."""
 
     def __init__(self, expected: str) -> None:
         self._expected = expected
@@ -81,23 +84,31 @@ class _FingerprintPolicy(paramiko.MissingHostKeyPolicy):
 
 
 @dataclass(slots=True)
-class _ByteCollector:
+class _OutputCollector:
     limit: int
-    buffer: bytearray = field(default_factory=bytearray)
+    head: bytearray = field(default_factory=bytearray)
+    tail: bytearray = field(default_factory=bytearray)
     total: int = 0
 
     def add(self, chunk: bytes) -> None:
         self.total += len(chunk)
-        remaining = self.limit - len(self.buffer)
+        remaining = self.limit - len(self.head)
         if remaining > 0:
-            self.buffer.extend(chunk[:remaining])
+            self.head.extend(chunk[:remaining])
+        self.tail.extend(chunk[-TAIL_BYTES:])
+        del self.tail[:-TAIL_BYTES]
 
-    @property
-    def truncated(self) -> bool:
-        return self.total > self.limit
-
-    def text(self) -> str:
-        return self.buffer.decode("utf-8", errors="replace")
+    def result(
+        self, *, completed: bool, exit_code: int | None, timed_out: bool = False
+    ) -> SSHExecution:
+        return SSHExecution(
+            completed=completed,
+            exit_code=exit_code,
+            output=bytes(self.head),
+            tail=bytes(self.tail),
+            truncated=self.total > self.limit,
+            timed_out=timed_out,
+        )
 
 
 @dataclass(slots=True)
@@ -112,8 +123,7 @@ class _DeviceState:
 class _AttemptFailure(Exception):
     cause: Exception
     dispatched: bool
-    stdout: _ByteCollector
-    stderr: _ByteCollector
+    output: _OutputCollector
 
 
 ClientFactory = Callable[[], Any]
@@ -129,7 +139,6 @@ class ParamikoSSHAdapter:
         max_workers: int = 8,
         max_pending_jobs: int = 16,
         per_device_queue_size: int = 32,
-        poll_interval_seconds: float = 0.01,
     ) -> None:
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1")
@@ -137,12 +146,9 @@ class ParamikoSSHAdapter:
             raise ValueError("max_pending_jobs cannot be negative")
         if per_device_queue_size < 0:
             raise ValueError("per_device_queue_size cannot be negative")
-        if poll_interval_seconds <= 0:
-            raise ValueError("poll_interval_seconds must be positive")
 
         self._client_factory = client_factory
         self._per_device_queue_size = per_device_queue_size
-        self._poll_interval_seconds = poll_interval_seconds
         self._states: dict[str, _DeviceState] = {}
         self._state_guard = asyncio.Lock()
         self._close_lock = asyncio.Lock()
@@ -158,9 +164,17 @@ class ParamikoSSHAdapter:
         # ThreadPoolExecutor's internal queue is unbounded. This gate bounds submitted work.
         self._worker_slots = asyncio.Semaphore(max_workers + max_pending_jobs)
 
-    async def execute(self, device: ResolvedDevice, command: str) -> SSHExecution:
-        device_id = str(device.device)
-        state, counted_waiter = await self._accept_request(device_id)
+    async def execute(
+        self,
+        device: ResolvedDevice,
+        command: str,
+        *,
+        output_limit_bytes: int | None = None,
+    ) -> SSHExecution:
+        """Run one command, defaulting to the device's configured output limit."""
+
+        limit = output_limit_bytes or device.config.output_limit_bytes
+        state, counted_waiter = await self._accept_request(device.device)
         acquired = False
         try:
             await state.lock.acquire()
@@ -168,7 +182,7 @@ class ParamikoSSHAdapter:
             if counted_waiter:
                 state.waiting -= 1
                 counted_waiter = False
-            return await self._run_blocking(self._execute_with_retry, state, device, command)
+            return await self._run_blocking(self._execute_with_retry, state, device, command, limit)
         finally:
             if counted_waiter:
                 state.waiting -= 1
@@ -232,14 +246,19 @@ class ParamikoSSHAdapter:
         state: _DeviceState,
         device: ResolvedDevice,
         command: str,
+        limit: int,
     ) -> SSHExecution:
         for attempt in range(2):
             try:
-                return self._execute_once(state, device, command)
+                return self._execute_once(state, device, command, limit)
             except _AttemptFailure as failure:
                 self._drop_client(state)
                 if failure.dispatched:
-                    return self._unknown_execution(failure)
+                    return failure.output.result(
+                        completed=False,
+                        exit_code=None,
+                        timed_out=isinstance(failure.cause, TimeoutError),
+                    )
                 if attempt == 0 and _is_retryable_pre_dispatch(failure.cause):
                     continue
                 raise _public_pre_dispatch_error(failure.cause) from failure.cause
@@ -250,15 +269,9 @@ class ParamikoSSHAdapter:
         state: _DeviceState,
         device: ResolvedDevice,
         command: str,
+        limit: int,
     ) -> SSHExecution:
-        limit = int(device.output_limit_bytes)
-        if limit < 0:
-            raise SSHAdapterError(
-                "INVALID_DEVICE_CONFIGURATION",
-                "output_limit_bytes cannot be negative",
-            )
-        stdout = _ByteCollector(limit)
-        stderr = _ByteCollector(limit)
+        output = _OutputCollector(limit)
         channel: Any | None = None
         dispatched = False
         try:
@@ -267,41 +280,35 @@ class ParamikoSSHAdapter:
             if transport is None or not transport.is_active():
                 raise ConnectionError("SSH transport is not active")
 
-            deadline = time.monotonic() + float(device.command_timeout_seconds)
+            deadline = time.monotonic() + device.config.command_timeout_seconds
             channel = transport.open_session(timeout=_remaining(deadline))
-            channel.settimeout(_remaining(deadline))
+            channel.set_combine_stderr(True)
             # From this point forward, the server may have received the command request.
             dispatched = True
             channel.exec_command(command)
-            exit_code = self._drain_channel(
-                channel,
-                transport,
-                stdout,
-                stderr,
-                deadline,
-            )
+            while True:
+                channel.settimeout(_remaining(deadline))
+                chunk = channel.recv(_RECV_BYTES)
+                if not chunk:
+                    break
+                output.add(chunk)
+            # Paramiko sets status_event when exit-status arrives or the channel closes.
+            if not channel.status_event.wait(_remaining(deadline)):
+                raise TimeoutError("SSH command timed out")
+            exit_code = channel.recv_exit_status()
+            if exit_code == -1:
+                raise ConnectionError("SSH channel closed without an exit status")
             state.last_used_at = time.monotonic()
-            return SSHExecution(
-                status="succeeded" if exit_code == 0 else "failed",
-                execution_state="completed",
-                exit_code=exit_code,
-                stdout=stdout.text(),
-                stderr=stderr.text(),
-                stdout_total_bytes=stdout.total,
-                stderr_total_bytes=stderr.total,
-                stdout_truncated=stdout.truncated,
-                stderr_truncated=stderr.truncated,
-            )
+            return output.result(completed=True, exit_code=exit_code)
         except Exception as exc:
-            raise _AttemptFailure(exc, dispatched, stdout, stderr) from exc
+            raise _AttemptFailure(exc, dispatched, output) from exc
         finally:
-            _safe_close_channel(channel)
+            _safe_close(channel)
 
     def _ensure_client(self, state: _DeviceState, device: ResolvedDevice) -> Any:
         client = state.client
         if client is not None:
-            idle_ttl = int(device.idle_ttl_seconds)
-            idle_expired = idle_ttl >= 0 and time.monotonic() - state.last_used_at >= idle_ttl
+            idle_expired = time.monotonic() - state.last_used_at >= device.config.idle_ttl_seconds
             transport = client.get_transport()
             if idle_expired or transport is None or not transport.is_active():
                 self._drop_client(state)
@@ -313,123 +320,58 @@ class ParamikoSSHAdapter:
         return client
 
     def _connect(self, device: ResolvedDevice) -> Any:
-        fingerprint = str(device.fingerprint_sha256)
-        if not fingerprint.startswith("SHA256:"):
-            raise SSHAdapterError(
-                "INVALID_DEVICE_CONFIGURATION",
-                "fingerprint_sha256 must be an OpenSSH SHA256 fingerprint",
-            )
-
+        config = device.config
+        fingerprint = config.host_key.fingerprint_sha256
         client = self._client_factory()
         try:
             client.set_missing_host_key_policy(_FingerprintPolicy(fingerprint))
-            auth_type = str(device.auth_type)
-            connect_kwargs: dict[str, Any] = {
-                "hostname": str(device.host),
-                "port": int(device.port),
-                "username": str(device.username),
-                "timeout": float(device.connect_timeout_seconds),
-                "banner_timeout": float(device.connect_timeout_seconds),
-                "auth_timeout": float(device.connect_timeout_seconds),
-                "channel_timeout": float(device.command_timeout_seconds),
-                "allow_agent": False,
-                "look_for_keys": False,
-            }
-            if auth_type == "password":
-                password = _secret_value(device.password)
-                if password is None:
-                    raise SSHAdapterError(
-                        "INVALID_DEVICE_CONFIGURATION",
-                        "password authentication requires a password",
-                    )
-                connect_kwargs["password"] = password
-            elif auth_type == "private_key":
-                private_key = _secret_value(device.private_key)
-                if private_key is None:
-                    raise SSHAdapterError(
-                        "INVALID_DEVICE_CONFIGURATION",
-                        "private-key authentication requires private_key",
-                    )
-                connect_kwargs["pkey"] = _load_private_key(
-                    private_key,
-                    _secret_value(device.passphrase),
-                )
+            credentials: dict[str, Any]
+            if isinstance(config.auth, PasswordAuthConfig):
+                assert device.password is not None
+                credentials = {"password": device.password.get_secret_value()}
             else:
-                raise SSHAdapterError(
-                    "INVALID_DEVICE_CONFIGURATION",
-                    f"unsupported SSH auth type {auth_type!r}",
-                )
-
-            client.connect(**connect_kwargs)
+                assert device.private_key is not None
+                passphrase = device.passphrase
+                credentials = {
+                    "pkey": _load_private_key(
+                        device.private_key.get_secret_value(),
+                        None if passphrase is None else passphrase.get_secret_value(),
+                    )
+                }
+            client.connect(
+                hostname=config.host,
+                port=config.port,
+                username=config.username,
+                timeout=config.connect_timeout_seconds,
+                banner_timeout=config.connect_timeout_seconds,
+                auth_timeout=config.connect_timeout_seconds,
+                channel_timeout=config.command_timeout_seconds,
+                allow_agent=False,
+                look_for_keys=False,
+                **credentials,
+            )
             transport = client.get_transport()
             if transport is None or not transport.is_active():
                 raise ConnectionError("SSH transport did not become active")
             _verify_fingerprint(transport.get_remote_server_key(), fingerprint)
-            keepalive = int(device.keepalive_seconds)
-            if keepalive > 0:
-                transport.set_keepalive(keepalive)
+            if config.keepalive_seconds > 0:
+                transport.set_keepalive(config.keepalive_seconds)
             return client
         except Exception:
-            _safe_close_client(client)
+            _safe_close(client)
             raise
-
-    def _drain_channel(
-        self,
-        channel: Any,
-        transport: Any,
-        stdout: _ByteCollector,
-        stderr: _ByteCollector,
-        deadline: float,
-    ) -> int:
-        while True:
-            if channel.recv_ready():
-                stdout.add(channel.recv(32 * 1024))
-            if channel.recv_stderr_ready():
-                stderr.add(channel.recv_stderr(32 * 1024))
-
-            if channel.exit_status_ready():
-                if not channel.recv_ready() and not channel.recv_stderr_ready():
-                    exit_code = int(channel.recv_exit_status())
-                    if exit_code == -1 and not transport.is_active():
-                        raise ConnectionError("SSH transport closed before confirming exit status")
-                    return exit_code
-            elif not transport.is_active():
-                raise ConnectionError("SSH transport closed before command completion")
-
-            remaining = _remaining(deadline)
-            time.sleep(min(self._poll_interval_seconds, remaining))
-
-    def _unknown_execution(self, failure: _AttemptFailure) -> SSHExecution:
-        timed_out = isinstance(failure.cause, (TimeoutError, socket.timeout))
-        return SSHExecution(
-            status="unknown",
-            execution_state="unknown",
-            exit_code=None,
-            stdout=failure.stdout.text(),
-            stderr=failure.stderr.text(),
-            stdout_total_bytes=failure.stdout.total,
-            stderr_total_bytes=failure.stderr.total,
-            stdout_truncated=failure.stdout.truncated,
-            stderr_truncated=failure.stderr.truncated,
-            error_code="COMMAND_TIMEOUT" if timed_out else "EXECUTION_OUTCOME_UNKNOWN",
-            error_message=(
-                "Command timed out after dispatch; execution outcome is unknown"
-                if timed_out
-                else "SSH failed after command dispatch; execution outcome is unknown"
-            ),
-        )
 
     @staticmethod
     def _close_clients(clients: list[Any]) -> None:
         for client in clients:
-            _safe_close_client(client)
+            _safe_close(client)
 
     @staticmethod
     def _drop_client(state: _DeviceState) -> None:
         client = state.client
         state.client = None
         state.last_used_at = 0.0
-        _safe_close_client(client)
+        _safe_close(client)
 
 
 def _remaining(deadline: float) -> float:
@@ -443,13 +385,6 @@ def _verify_fingerprint(key: Any, expected: str) -> None:
     actual = getattr(key, "fingerprint", None)
     if not isinstance(actual, str) or not hmac.compare_digest(actual, expected):
         raise _FingerprintMismatch("SSH host-key fingerprint does not match configuration")
-
-
-def _secret_value(value: Any | None) -> str | None:
-    if value is None:
-        return None
-    getter = getattr(value, "get_secret_value", None)
-    return str(getter() if getter is not None else value)
 
 
 def _load_private_key(private_key: str, passphrase: str | None) -> paramiko.PKey:
@@ -492,7 +427,7 @@ def _public_pre_dispatch_error(exc: Exception) -> SSHAdapterError:
         return SSHAdapterError("SSH_PRIVATE_KEY_INVALID", str(exc))
     if isinstance(exc, paramiko.AuthenticationException):
         return SSHAdapterError("SSH_AUTH_FAILED", "SSH authentication failed")
-    if isinstance(exc, (TimeoutError, socket.timeout)):
+    if isinstance(exc, TimeoutError):
         return SSHAdapterError(
             "SSH_CONNECT_TIMEOUT",
             "SSH connection or channel setup timed out",
@@ -505,17 +440,9 @@ def _public_pre_dispatch_error(exc: Exception) -> SSHAdapterError:
     )
 
 
-def _safe_close_channel(channel: Any | None) -> None:
-    if channel is not None:
+def _safe_close(resource: Any | None) -> None:
+    if resource is not None:
         try:
-            channel.close()
-        except Exception:
-            pass
-
-
-def _safe_close_client(client: Any | None) -> None:
-    if client is not None:
-        try:
-            client.close()
+            resource.close()
         except Exception:
             pass

@@ -4,7 +4,7 @@
 [![Container](https://github.com/asharca/ros-mcp/actions/workflows/container.yml/badge.svg)](https://github.com/asharca/ros-mcp/actions/workflows/container.yml)
 
 ROS-MCP is a small MCP gateway for managing multiple MikroTik RouterOS devices
-over SSH. It exposes exactly two tools and keeps device credentials, SSH session
+over SSH. It exposes three tools and keeps device credentials, SSH session
 reuse, retries, timeouts, and output limits behind the gateway.
 
 Despite the project name, `ROS` means MikroTik RouterOS, not Robot Operating
@@ -14,24 +14,61 @@ System.
 
 ### `device_list`
 
-Returns the configured, non-sensitive device inventory. It performs no network
-I/O and never returns passwords, private keys, environment-variable names, or
-host-key fingerprints.
+Returns the configured, non-sensitive device inventory: ID, display name,
+description, host, enabled flag, and tags. It performs no network I/O.
+
+### `command_read`
+
+```text
+command_read(device: string, command: string)
+```
+
+Runs one `print`, `export`, `get`, `monitor`, or `monitor-traffic` command, for
+example `/ip address print where interface=ether1`. It is annotated read-only,
+so MCP clients can allow it without per-call approval.
+
+The gateway rejects scripting (`;`, `[ ]`, `{ }`, `$`, and `:` commands) and
+the `file=` and `show-sensitive` arguments. It then asks the device to parse the
+command with `:parse` and runs it only when RouterOS reports exactly one command
+with a read verb. This is a guardrail for client auto-approval, not an
+authorization boundary: to enforce read-only access, give the SSH user a
+RouterOS group without the `write` policy.
 
 ### `command_execute`
 
 ```text
-command_execute(device: string, command: string, dry_run: boolean = true)
+command_execute(device: string, command: string, dry_run: boolean = false)
 ```
 
-- `device` is always required. There is no implicit default-device fallback.
-- `command` is one RouterOS CLI line, limited to 8 KiB.
-- `dry_run=true` validates locally and does not open an SSH connection.
-- A result with `status=unknown` means the command may have executed and must
-  not be retried automatically.
+Runs one RouterOS CLI line that may change state. It is annotated destructive;
+keep manual approval enabled for it in the MCP client.
 
-The gateway does not implement RouterOS Safe Mode and does not claim that a dry
-run validates RouterOS syntax or effects.
+- `command` is one line, limited to 8 KiB.
+- Before running, the device parses the command with `:parse`. A syntax error,
+  such as an unknown command or parameter, returns `rejected` without running
+  anything.
+- `dry_run=true` stops after that check and returns `validated`. The check
+  covers syntax only, not values, references to items, or effects.
+
+### Results
+
+Both command tools return `status`, `output`, `output_truncated`,
+`duration_ms`, and `error` (`code`, `message`, `retryable`).
+
+| `status` | Meaning |
+| --- | --- |
+| `validated` | `dry_run` only: the command parsed; nothing ran. |
+| `rejected` | The command did not run (validation, syntax, or connection failure). |
+| `succeeded` | The command ran and RouterOS reported no error. |
+| `failed` | The command ran and RouterOS printed an error. Earlier statements may have taken effect. |
+| `unknown` | The command was sent but the session failed or timed out. A change may have taken effect: inspect the device before retrying. |
+
+RouterOS's SSH server returns exit status 0 even for failed commands. The
+gateway therefore detects failures from RouterOS's error line, such as
+`no such item (/ip/address/get; line 1)`, which ends the output. Output is
+returned with carriage returns and RouterOS's column padding removed.
+
+The gateway does not implement RouterOS Safe Mode.
 
 ## Configuration
 
@@ -58,7 +95,7 @@ defines its SSH authentication method.
     "command_timeout_seconds": 25,
     "keepalive_seconds": 30,
     "idle_ttl_seconds": 300,
-    "output_limit_bytes": 1048576,
+    "output_limit_bytes": 65536,
     "auth": {
       "type": "password",
       "password": "REPLACE_WITH_ROUTEROS_SSH_PASSWORD"
@@ -93,14 +130,20 @@ For password authentication, set exactly one of these fields:
   credential environment variable is required.
 - `password_env`: the name of an environment variable containing the password.
 
-The legacy `password_env` form remains supported. Private-key authentication
-continues to use `private_key_env` and optional `passphrase_env` references:
+Private-key authentication takes the key from exactly one of
+`private_key_file` (a path; relative paths resolve against the configuration
+file's directory, or the working directory with `ROS_DEVICES_JSON`) or
+`private_key_env`. An optional `passphrase_env` names the passphrase variable:
 
 ```text
 ROS_MAIN_PASSWORD=<main RouterOS SSH password>
 ROS_OFFICE_PRIVATE_KEY=<complete PEM/OpenSSH private-key text>
 ROS_OFFICE_KEY_PASSPHRASE=<optional key passphrase>
 ```
+
+`output_limit_bytes` (default 65536) caps the output returned per command;
+larger output is cut and reported with `output_truncated=true`. Keep it small
+enough for the model's context.
 
 An inline `password` is plaintext in the configuration file. Treat that file as
 a secret: do not commit it, and mount it read-only in containers. For a local
@@ -113,8 +156,8 @@ resolved once at startup, so restart the server after changing a configuration
 file. Missing secrets, unknown fields, duplicate JSON keys, invalid IDs, and
 malformed SHA-256 fingerprints prevent startup.
 
-The host-key fingerprint is mandatory. Unknown keys are never accepted through
-TOFU or Paramiko's `AutoAddPolicy`.
+The host-key fingerprint is mandatory and is checked before authentication.
+Unknown keys are never accepted through TOFU or Paramiko's `AutoAddPolicy`.
 
 ## Run locally
 
@@ -146,7 +189,7 @@ Use `uvx` to run a released version without cloning this repository. Pin the
 Git tag (or a full commit SHA) so deployments do not move with a branch:
 
 ```bash
-uvx --from 'git+https://github.com/asharca/ros-mcp.git@v0.1.0' \
+uvx --from 'git+https://github.com/asharca/ros-mcp.git@v0.2.0' \
   ros-mcp --config /absolute/path/to/devices.json
 ```
 
@@ -204,7 +247,8 @@ networking because the gateway needs outbound SSH access to RouterOS devices.
 Use a managed secret mount or set an owner/ACL that permits UID/GID `10001` to
 read the file without making it world-readable. If the file uses `password_env`,
 `private_key_env`, or `passphrase_env`, forward each referenced variable with
-Docker's `-e` option.
+Docker's `-e` option. A `private_key_file` must also be mounted into the
+container at the path the configuration names.
 
 ## Deploy as an MCP server
 
@@ -222,7 +266,7 @@ use either of the following shapes.
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/asharca/ros-mcp.git@v0.1.0",
+        "git+https://github.com/asharca/ros-mcp.git@v0.2.0",
         "ros-mcp",
         "--config",
         "/absolute/path/to/devices.json"
@@ -284,12 +328,14 @@ above the gateway's command timeout.
 ## Execution behavior
 
 - One reusable SSH session is maintained per device.
-- Commands for the same device are serialized in a bounded FIFO.
+- Commands for the same device are serialized in a bounded FIFO. The syntax
+  check and the command it guards are two separate requests on that session.
 - Different devices can execute concurrently.
 - A stale session may reconnect once before command dispatch.
 - A command is never replayed after dispatch.
-- stdout and stderr are drained concurrently and retained up to the configured
-  per-stream byte limit.
+- stdout and stderr are read as one stream and retained up to
+  `output_limit_bytes`; the last 1 KiB is always kept to detect a RouterOS
+  error after truncated output.
 - All SSH clients are explicitly closed during MCP server shutdown.
 
 ## Logging

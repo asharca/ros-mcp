@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
@@ -47,11 +48,6 @@ class StrictModel(BaseModel):
     )
 
 
-class AuthType(StrEnum):
-    PASSWORD = "password"
-    PRIVATE_KEY = "private_key"
-
-
 class PasswordAuthConfig(StrictModel):
     type: Literal["password"]
     password: SecretStr | None = Field(default=None, exclude=True, repr=False)
@@ -75,8 +71,18 @@ class PasswordAuthConfig(StrictModel):
 
 class PrivateKeyAuthConfig(StrictModel):
     type: Literal["private_key"]
-    private_key_env: EnvironmentVariableName = Field(repr=False)
+    private_key_env: EnvironmentVariableName | None = Field(default=None, repr=False)
+    private_key_file: NonEmptyString | None = Field(default=None, repr=False)
     passphrase_env: EnvironmentVariableName | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def validate_private_key_source(self) -> Self:
+        if (self.private_key_env is None) == (self.private_key_file is None):
+            raise ValueError(
+                "private-key authentication requires exactly one of "
+                "private_key_env or private_key_file"
+            )
+        return self
 
 
 AuthConfig = Annotated[
@@ -130,7 +136,7 @@ class DeviceConfig(StrictModel):
     command_timeout_seconds: PositiveSeconds = 60
     keepalive_seconds: NonNegativeSeconds = 30
     idle_ttl_seconds: NonNegativeSeconds = 300
-    output_limit_bytes: PositiveByteCount = 1_048_576
+    output_limit_bytes: PositiveByteCount = 65_536
     auth: AuthConfig
     host_key: HostKeyConfig
 
@@ -165,142 +171,65 @@ class DeviceSummary(StrictModel):
     display_name: NonEmptyString
     description: str | None = None
     host: NonEmptyString
-    port: Port
-    username: NonEmptyString
-    auth_type: AuthType
     enabled: StrictBool
     tags: tuple[str, ...] = ()
-    connect_timeout_seconds: PositiveSeconds
-    command_timeout_seconds: PositiveSeconds
-    keepalive_seconds: NonNegativeSeconds
-    idle_ttl_seconds: NonNegativeSeconds
-    output_limit_bytes: PositiveByteCount
 
 
 class DeviceListResult(StrictModel):
     devices: tuple[DeviceSummary, ...]
 
 
-class ResolvedDevice(StrictModel):
-    """Internal device model with environment references resolved in memory."""
+@dataclass(frozen=True, slots=True)
+class ResolvedDevice:
+    """A configured device with its secrets resolved in memory."""
 
-    device: DeviceId
-    display_name: NonEmptyString
-    description: str | None = None
-    host: NonEmptyString
-    port: Port
-    username: NonEmptyString
-    auth_type: AuthType
-    enabled: StrictBool
-    tags: tuple[str, ...] = ()
-    connect_timeout_seconds: PositiveSeconds
-    command_timeout_seconds: PositiveSeconds
-    keepalive_seconds: NonNegativeSeconds
-    idle_ttl_seconds: NonNegativeSeconds
-    output_limit_bytes: PositiveByteCount
-    password: SecretStr | None = Field(default=None, exclude=True, repr=False)
-    private_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
-    passphrase: SecretStr | None = Field(
-        default=None,
-        exclude=True,
-        repr=False,
-    )
-    fingerprint_sha256: str = Field(exclude=True, repr=False)
+    device: str
+    config: DeviceConfig
+    password: SecretStr | None = field(default=None, repr=False)
+    private_key: SecretStr | None = field(default=None, repr=False)
+    passphrase: SecretStr | None = field(default=None, repr=False)
 
-    @model_validator(mode="after")
-    def validate_auth_material(self) -> Self:
-        if self.auth_type is AuthType.PASSWORD:
-            if self.password is None:
-                raise ValueError("password authentication requires a password")
-            if self.private_key is not None or self.passphrase is not None:
-                raise ValueError("password authentication cannot include private-key data")
-        else:
-            if self.private_key is None:
-                raise ValueError("private-key authentication requires a private key")
-            if self.password is not None:
-                raise ValueError("private-key authentication cannot include a password")
-        return self
-
-    def to_summary(self) -> DeviceSummary:
+    def summary(self) -> DeviceSummary:
         return DeviceSummary(
             device=self.device,
-            display_name=self.display_name,
-            description=self.description,
-            host=self.host,
-            port=self.port,
-            username=self.username,
-            auth_type=self.auth_type,
-            enabled=self.enabled,
-            tags=self.tags,
-            connect_timeout_seconds=self.connect_timeout_seconds,
-            command_timeout_seconds=self.command_timeout_seconds,
-            keepalive_seconds=self.keepalive_seconds,
-            idle_ttl_seconds=self.idle_ttl_seconds,
-            output_limit_bytes=self.output_limit_bytes,
+            display_name=self.config.display_name or self.device,
+            description=self.config.description,
+            host=self.config.host,
+            enabled=self.config.enabled,
+            tags=self.config.tags,
         )
 
 
 class CommandStatus(StrEnum):
-    DRY_RUN = "dry_run"
+    VALIDATED = "validated"
+    """dry_run only: RouterOS parsed the command; nothing was executed."""
+    REJECTED = "rejected"
+    """The command was not executed."""
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    """The command ran and RouterOS reported an error; earlier statements may have taken effect."""
     UNKNOWN = "unknown"
-
-
-class ExecutionState(StrEnum):
-    NOT_STARTED = "not_started"
-    COMPLETED = "completed"
-    UNKNOWN = "unknown"
+    """The command was sent but its outcome is unknown; it may have taken effect."""
 
 
 class CommandError(StrictModel):
     code: Annotated[str, StringConstraints(strict=True, pattern=r"^[A-Z][A-Z0-9_]*$")]
     message: NonEmptyString
     retryable: StrictBool = False
-    may_have_executed: StrictBool = False
 
 
 class CommandResult(StrictModel):
     # Echo the caller's target even when it is not a valid configured DeviceId.
     device: Annotated[str, StringConstraints(strict=True)]
     status: CommandStatus
-    execution_state: ExecutionState
-    exit_code: int | None = None
-    stdout: str = ""
-    stderr: str = ""
-    stdout_truncated: StrictBool = False
-    stderr_truncated: StrictBool = False
+    output: str = ""
+    output_truncated: StrictBool = False
     duration_ms: NonNegativeMilliseconds
     error: CommandError | None = None
 
     @model_validator(mode="after")
-    def validate_state_combination(self) -> Self:
-        if self.execution_state is not ExecutionState.COMPLETED and self.exit_code is not None:
-            raise ValueError("exit_code is only valid for completed execution")
-
-        if self.status is CommandStatus.DRY_RUN:
-            if self.execution_state is not ExecutionState.NOT_STARTED:
-                raise ValueError("dry_run must have execution_state='not_started'")
-            if self.exit_code is not None or self.error is not None:
-                raise ValueError("dry_run cannot include an exit code or error")
-        elif self.status is CommandStatus.SUCCEEDED:
-            if self.execution_state is not ExecutionState.COMPLETED or self.exit_code != 0:
-                raise ValueError("succeeded must be completed with exit_code=0")
-            if self.error is not None:
-                raise ValueError("succeeded cannot include an error")
-        elif self.status is CommandStatus.FAILED:
-            if self.execution_state is ExecutionState.UNKNOWN:
-                raise ValueError("failed cannot have an unknown execution state")
-            if self.execution_state is ExecutionState.NOT_STARTED:
-                if self.exit_code is not None or self.error is None:
-                    raise ValueError("a pre-dispatch failure requires an error and no exit code")
-            elif self.exit_code is None or self.exit_code == 0:
-                raise ValueError("a completed failure requires a non-zero exit code")
-        else:
-            if self.execution_state is not ExecutionState.UNKNOWN:
-                raise ValueError("unknown status requires execution_state='unknown'")
-            if self.exit_code is not None or self.error is None:
-                raise ValueError("unknown execution requires an error and no exit code")
-            if not self.error.may_have_executed:
-                raise ValueError("unknown execution must set may_have_executed=true")
+    def validate_error_presence(self) -> Self:
+        needs_error = self.status not in (CommandStatus.VALIDATED, CommandStatus.SUCCEEDED)
+        if needs_error != (self.error is not None):
+            raise ValueError(f"status {self.status.value!r} requires error={needs_error}")
         return self

@@ -11,7 +11,7 @@
     "command_timeout_seconds": 25,
     "keepalive_seconds": 30,
     "idle_ttl_seconds": 300,
-    "output_limit_bytes": 1048576,
+    "output_limit_bytes": 65536,
     "auth": {
       "type": "password",
       "password": "REPLACE_WITH_ROUTEROS_SSH_PASSWORD"

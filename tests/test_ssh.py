@@ -5,35 +5,36 @@ import io
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
 from typing import Any
 
 import paramiko
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from pydantic import SecretStr
 
-from ros_mcp.ssh import ParamikoSSHAdapter, SSHAdapterError, _load_private_key
+from ros_mcp.models import DeviceConfig, ResolvedDevice
+from ros_mcp.ssh import TAIL_BYTES, ParamikoSSHAdapter, SSHAdapterError, _load_private_key
 
-FINGERPRINT = "SHA256:test-fingerprint"
+FINGERPRINT = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+WRONG_FINGERPRINT = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"
 
 
-@dataclass(slots=True)
-class Device:
-    device: str
-    host: str = "192.0.2.1"
-    port: int = 22
-    username: str = "ai-mgmt"
-    auth_type: str = "password"
-    password: str | None = "secret"
-    private_key: str | None = None
-    passphrase: str | None = None
-    fingerprint_sha256: str = FINGERPRINT
-    connect_timeout_seconds: float = 0.2
-    command_timeout_seconds: float = 0.5
-    keepalive_seconds: int = 30
-    idle_ttl_seconds: int = 300
-    output_limit_bytes: int = 1024
+def Device(device_id: str, **overrides: Any) -> ResolvedDevice:
+    config = DeviceConfig.model_validate(
+        {
+            "host": "192.0.2.1",
+            "username": "ai-mgmt",
+            "output_limit_bytes": 1024,
+            "auth": {"type": "password", "password_env": "UNUSED"},
+            "host_key": {"fingerprint_sha256": FINGERPRINT},
+        }
+    )
+    # Sub-second timeouts keep tests fast; model_copy skips the integer-seconds validation.
+    config = config.model_copy(
+        update={"connect_timeout_seconds": 0.2, "command_timeout_seconds": 0.5, **overrides}
+    )
+    return ResolvedDevice(device=device_id, config=config, password=SecretStr("secret"))
 
 
 class FakeKey:
@@ -42,25 +43,31 @@ class FakeKey:
 
 
 class FakeChannel:
+    """Deliver output chunks, then end the stream once ``delay`` has passed."""
+
     def __init__(
         self,
         *,
-        stdout: list[bytes] | None = None,
-        stderr: list[bytes] | None = None,
+        output: list[bytes] | None = None,
         exit_code: int = 0,
         delay: float = 0.0,
         exec_error: Exception | None = None,
         tracker: CommandTracker | None = None,
     ) -> None:
-        self.stdout = deque(stdout or [])
-        self.stderr = deque(stderr or [])
+        self.output = deque(output or [])
         self.exit_code = exit_code
         self.delay = delay
         self.exec_error = exec_error
         self.tracker = tracker
         self.started_at: float | None = None
+        self.timeout: float | None = None
         self.closed = False
+        self.combined_stderr = False
         self.command: str | None = None
+        self.status_event = threading.Event()
+
+    def set_combine_stderr(self, combine: bool) -> None:
+        self.combined_stderr = combine
 
     def settimeout(self, timeout: float) -> None:
         self.timeout = timeout
@@ -73,23 +80,18 @@ class FakeChannel:
         if self.exec_error is not None:
             raise self.exec_error
 
-    def recv_ready(self) -> bool:
-        return bool(self.stdout)
-
     def recv(self, size: int) -> bytes:
         del size
-        return self.stdout.popleft()
-
-    def recv_stderr_ready(self) -> bool:
-        return bool(self.stderr)
-
-    def recv_stderr(self, size: int) -> bytes:
-        del size
-        return self.stderr.popleft()
-
-    def exit_status_ready(self) -> bool:
-        assert self.started_at is not None
-        return time.monotonic() - self.started_at >= self.delay
+        if self.output:
+            return self.output.popleft()
+        assert self.started_at is not None and self.timeout is not None
+        wait = self.started_at + self.delay - time.monotonic()
+        if wait > self.timeout:
+            time.sleep(self.timeout)
+            raise TimeoutError("timed out")
+        time.sleep(max(0.0, wait))
+        self.status_event.set()
+        return b""
 
     def recv_exit_status(self) -> int:
         return self.exit_code
@@ -197,17 +199,15 @@ async def test_same_device_is_serialized_in_fifo_order() -> None:
         FakeChannel(delay=0.01, tracker=tracker),
     ]
     client = FakeClient(FakeTransport(channels))
-    adapter = ParamikoSSHAdapter(
-        client_factory=ClientFactory([client]),
-        poll_interval_seconds=0.001,
-    )
+    adapter = ParamikoSSHAdapter(client_factory=ClientFactory([client]))
 
     first = asyncio.create_task(adapter.execute(Device("main"), "first"))
     await asyncio.to_thread(tracker.entered.wait, 0.2)
     second = asyncio.create_task(adapter.execute(Device("main"), "second"))
     results = await asyncio.gather(first, second)
 
-    assert [result.status for result in results] == ["succeeded", "succeeded"]
+    assert [result.completed for result in results] == [True, True]
+    assert all(channel.combined_stderr for channel in channels)
     assert [channel.command for channel in channels] == ["first", "second"]
     assert tracker.max_active == 1
     assert client.connect_calls == 1
@@ -222,7 +222,6 @@ async def test_different_devices_execute_in_parallel() -> None:
     adapter = ParamikoSSHAdapter(
         client_factory=ClientFactory([first_client, second_client]),
         max_workers=2,
-        poll_interval_seconds=0.001,
     )
 
     await asyncio.gather(
@@ -248,7 +247,6 @@ async def test_per_device_waiting_queue_is_bounded() -> None:
     adapter = ParamikoSSHAdapter(
         client_factory=ClientFactory([client]),
         per_device_queue_size=1,
-        poll_interval_seconds=0.001,
     )
 
     first = asyncio.create_task(adapter.execute(Device("main"), "first"))
@@ -266,7 +264,7 @@ async def test_per_device_waiting_queue_is_bounded() -> None:
 
 @pytest.mark.asyncio
 async def test_fingerprint_mismatch_is_rejected_without_retry() -> None:
-    client = FakeClient(FakeTransport([], fingerprint="SHA256:wrong"))
+    client = FakeClient(FakeTransport([], fingerprint=WRONG_FINGERPRINT))
     factory = ClientFactory([client])
     adapter = ParamikoSSHAdapter(client_factory=factory)
 
@@ -274,7 +272,6 @@ async def test_fingerprint_mismatch_is_rejected_without_retry() -> None:
         await adapter.execute(Device("main"), "command")
 
     assert raised.value.code == "SSH_HOST_KEY_MISMATCH"
-    assert raised.value.may_have_executed is False
     assert len(factory.created) == 1
     assert client.closed
     await adapter.aclose()
@@ -286,11 +283,12 @@ async def test_pre_dispatch_failure_reconnects_once() -> None:
     replacement_channel = FakeChannel()
     replacement = FakeClient(FakeTransport([replacement_channel]))
     factory = ClientFactory([stale, replacement])
-    adapter = ParamikoSSHAdapter(client_factory=factory, poll_interval_seconds=0.001)
+    adapter = ParamikoSSHAdapter(client_factory=factory)
 
     result = await adapter.execute(Device("main"), "command")
 
-    assert result.status == "succeeded"
+    assert result.completed is True
+    assert result.exit_code == 0
     assert len(factory.created) == 2
     assert stale.closed
     assert replacement_channel.command == "command"
@@ -307,9 +305,8 @@ async def test_post_dispatch_failure_is_unknown_and_is_not_retried() -> None:
 
     result = await adapter.execute(Device("main"), "command")
 
-    assert result.status == "unknown"
-    assert result.execution_state == "unknown"
-    assert result.error_code == "EXECUTION_OUTCOME_UNKNOWN"
+    assert result.completed is False
+    assert result.timed_out is False
     assert len(factory.created) == 1
     assert client.closed
     assert channel.closed
@@ -322,37 +319,43 @@ async def test_post_dispatch_timeout_is_unknown_and_is_not_retried() -> None:
     client = FakeClient(FakeTransport([channel]))
     unused = FakeClient(FakeTransport([FakeChannel()]))
     factory = ClientFactory([client, unused])
-    adapter = ParamikoSSHAdapter(client_factory=factory, poll_interval_seconds=0.001)
+    adapter = ParamikoSSHAdapter(client_factory=factory)
 
     result = await adapter.execute(Device("main", command_timeout_seconds=0.01), "command")
 
-    assert result.status == "unknown"
-    assert result.error_code == "COMMAND_TIMEOUT"
+    assert result.completed is False
+    assert result.timed_out is True
     assert len(factory.created) == 1
     assert client.closed
     await adapter.aclose()
 
 
 @pytest.mark.asyncio
-async def test_each_output_stream_is_bounded_and_reports_total_bytes() -> None:
-    channel = FakeChannel(
-        stdout=[b"1234", b"5678"],
-        stderr=[b"abc", b"\xffdef"],
-    )
+async def test_output_is_bounded_but_keeps_the_tail_for_error_detection() -> None:
+    error_line = b"no such item (/ip/address/get; line 1)\n"
+    channel = FakeChannel(output=[b"1234", b"5678" * 500, error_line])
     client = FakeClient(FakeTransport([channel]))
-    adapter = ParamikoSSHAdapter(
-        client_factory=ClientFactory([client]),
-        poll_interval_seconds=0.001,
-    )
+    adapter = ParamikoSSHAdapter(client_factory=ClientFactory([client]))
 
     result = await adapter.execute(Device("main", output_limit_bytes=5), "command")
 
-    assert result.stdout == "12345"
-    assert result.stderr == "abc\ufffdd"
-    assert result.stdout_total_bytes == 8
-    assert result.stderr_total_bytes == 7
-    assert result.stdout_truncated is True
-    assert result.stderr_truncated is True
+    assert result.output == b"12345"
+    assert result.truncated is True
+    assert len(result.tail) == TAIL_BYTES
+    assert result.tail.endswith(error_line)
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_output_limit_overrides_the_device_limit() -> None:
+    channel = FakeChannel(output=[b"x" * 2000])
+    client = FakeClient(FakeTransport([channel]))
+    adapter = ParamikoSSHAdapter(client_factory=ClientFactory([client]))
+
+    result = await adapter.execute(Device("main"), "command", output_limit_bytes=4096)
+
+    assert len(result.output) == 2000
+    assert result.truncated is False
     await adapter.aclose()
 
 
@@ -363,7 +366,6 @@ async def test_aclose_closes_all_sessions_and_rejects_new_work() -> None:
     adapter = ParamikoSSHAdapter(
         client_factory=ClientFactory([first_client, second_client]),
         max_workers=2,
-        poll_interval_seconds=0.001,
     )
     await asyncio.gather(
         adapter.execute(Device("main"), "one"),

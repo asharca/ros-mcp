@@ -1,4 +1,4 @@
-"""Core RouterOS gateway exposed through the two MCP tools."""
+"""Core RouterOS gateway behind the MCP tools."""
 
 from __future__ import annotations
 
@@ -15,12 +15,29 @@ from .models import (
     CommandResult,
     CommandStatus,
     DeviceListResult,
-    ExecutionState,
+    ResolvedDevice,
+)
+from .routeros import (
+    ParsedCommand,
+    interpret_parse_output,
+    normalize_output,
+    parse_check_script,
+    read_only_violation,
+    read_verb_violation,
+    runtime_error,
 )
 from .ssh import ParamikoSSHAdapter, SSHAdapterError, SSHCommandPort, SSHExecution
 
 MAX_COMMAND_BYTES = 8 * 1024
+# A parse of an 8 KiB command with several where-clauses stays far below this.
+PARSE_OUTPUT_LIMIT_BYTES = 256 * 1024
 _DEVICE_ID_RE = re.compile(DEVICE_ID_PATTERN)
+
+
+class _Rejected(Exception):
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.error = CommandError(code=code, message=message, retryable=retryable)
 
 
 class Gateway:
@@ -35,81 +52,135 @@ class Gateway:
 
         return self._registry.list_devices()
 
+    async def command_read(self, device: str, command: str) -> CommandResult:
+        """Run one read-only command (print/export/get/monitor)."""
+
+        started = time.perf_counter_ns()
+        try:
+            resolved = self._resolve(device, command)
+            violation = read_only_violation(command)
+            if violation is not None:
+                raise _Rejected("READ_ONLY_VIOLATION", violation)
+            parsed = await self._parse(resolved, command)
+            violation = read_verb_violation(parsed)
+            if violation is not None:
+                raise _Rejected("READ_ONLY_VIOLATION", violation)
+            return await self._run(resolved, command, started, read_only=True)
+        except _Rejected as rejected:
+            return _result(device, CommandStatus.REJECTED, started, error=rejected.error)
+
     async def command_execute(
         self,
         device: str,
         command: str,
-        dry_run: bool = True,
+        dry_run: bool = False,
     ) -> CommandResult:
-        """Validate and optionally execute one RouterOS command on one device."""
+        """Syntax-check one command on the device, then run it unless ``dry_run``."""
 
         started = time.perf_counter_ns()
-
-        request_error = _validate_request(device, command)
-        if request_error is not None:
-            return _failed_before_dispatch(device, request_error, started)
-
         try:
-            resolved = self._registry.get(device)
-        except DeviceNotFoundError:
-            return _failed_before_dispatch(
-                device,
-                CommandError(
-                    code="DEVICE_NOT_FOUND",
-                    message=f"Device {device!r} is not configured",
-                ),
-                started,
-            )
-
-        if not resolved.enabled:
-            return _failed_before_dispatch(
-                device,
-                CommandError(
-                    code="DEVICE_DISABLED",
-                    message=f"Device {device!r} is disabled",
-                ),
-                started,
-            )
-
-        if dry_run:
-            return CommandResult(
-                device=device,
-                status=CommandStatus.DRY_RUN,
-                execution_state=ExecutionState.NOT_STARTED,
-                duration_ms=_elapsed_ms(started),
-            )
-
-        try:
-            execution = await self._ssh.execute(resolved, command)
-        except SSHAdapterError as exc:
-            return _failed_before_dispatch(
-                device,
-                CommandError(
-                    code=exc.code,
-                    message=exc.message,
-                    retryable=exc.retryable,
-                    may_have_executed=False,
-                ),
-                started,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _failed_before_dispatch(
-                device,
-                CommandError(
-                    code="INTERNAL_ERROR",
-                    message="SSH execution failed before an outcome was available",
-                ),
-                started,
-            )
-
-        return _map_execution(device, execution, started)
+            resolved = self._resolve(device, command)
+            await self._parse(resolved, command)
+            if dry_run:
+                return _result(device, CommandStatus.VALIDATED, started)
+            return await self._run(resolved, command, started, read_only=False)
+        except _Rejected as rejected:
+            return _result(device, CommandStatus.REJECTED, started, error=rejected.error)
 
     async def aclose(self) -> None:
         """Close all reusable SSH sessions."""
 
         await self._ssh.aclose()
+
+    def _resolve(self, device: str, command: str) -> ResolvedDevice:
+        _validate_request(device, command)
+        try:
+            resolved = self._registry.get(device)
+        except DeviceNotFoundError:
+            raise _Rejected("DEVICE_NOT_FOUND", f"Device {device!r} is not configured") from None
+        if not resolved.config.enabled:
+            raise _Rejected("DEVICE_DISABLED", f"Device {device!r} is disabled")
+        return resolved
+
+    async def _parse(self, device: ResolvedDevice, command: str) -> ParsedCommand:
+        """Ask RouterOS to compile the command without running it."""
+
+        execution = await self._ssh_execute(
+            device,
+            parse_check_script(command),
+            output_limit_bytes=PARSE_OUTPUT_LIMIT_BYTES,
+        )
+        if not execution.completed or execution.exit_code != 0 or execution.truncated:
+            # Only the parse script was sent, so the command itself has not run.
+            raise _Rejected(
+                "SYNTAX_CHECK_FAILED",
+                "Could not complete the RouterOS syntax check; the command was not run",
+                retryable=True,
+            )
+        parsed = interpret_parse_output(execution.output.decode("utf-8", errors="replace"))
+        if parsed.errors:
+            raise _Rejected("SYNTAX_ERROR", "; ".join(parsed.errors))
+        return parsed
+
+    async def _run(
+        self,
+        device: ResolvedDevice,
+        command: str,
+        started: int,
+        *,
+        read_only: bool,
+    ) -> CommandResult:
+        execution = await self._ssh_execute(device, command)
+        output = normalize_output(execution.output)
+        common = {"output": output, "output_truncated": execution.truncated}
+
+        if not execution.completed:
+            reason = "timed out" if execution.timed_out else "lost its SSH session"
+            if read_only:
+                error = CommandError(
+                    code="OUTCOME_UNKNOWN",
+                    message=f"Read command {reason} before completing; it is safe to retry",
+                    retryable=True,
+                )
+            else:
+                error = CommandError(
+                    code="OUTCOME_UNKNOWN",
+                    message=(
+                        f"Command {reason} after it was sent; it may have taken effect. "
+                        "Check device state before retrying"
+                    ),
+                )
+            return _result(device.device, CommandStatus.UNKNOWN, started, error=error, **common)
+
+        error_line = runtime_error(execution.tail)
+        if error_line is not None:
+            error = CommandError(code="ROUTEROS_ERROR", message=error_line)
+            return _result(device.device, CommandStatus.FAILED, started, error=error, **common)
+        if execution.exit_code != 0:
+            error = CommandError(
+                code="REMOTE_EXIT_STATUS",
+                message=f"Remote command exited with status {execution.exit_code}",
+            )
+            return _result(device.device, CommandStatus.FAILED, started, error=error, **common)
+        return _result(device.device, CommandStatus.SUCCEEDED, started, **common)
+
+    async def _ssh_execute(
+        self,
+        device: ResolvedDevice,
+        command: str,
+        *,
+        output_limit_bytes: int | None = None,
+    ) -> SSHExecution:
+        try:
+            return await self._ssh.execute(device, command, output_limit_bytes=output_limit_bytes)
+        except SSHAdapterError as exc:
+            raise _Rejected(exc.code, exc.message, retryable=exc.retryable) from None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _Rejected(
+                "INTERNAL_ERROR", "SSH execution failed before the command was sent"
+            ) from None
 
 
 def create_gateway_from_env(
@@ -135,92 +206,39 @@ def create_gateway_from_file(
     )
 
 
-def _validate_request(device: object, command: object) -> CommandError | None:
+def _validate_request(device: object, command: object) -> None:
     if not isinstance(device, str) or _DEVICE_ID_RE.fullmatch(device) is None:
-        return CommandError(
-            code="INVALID_DEVICE",
-            message=f"device must match {DEVICE_ID_PATTERN}",
-        )
+        raise _Rejected("INVALID_DEVICE", f"device must match {DEVICE_ID_PATTERN}")
     if not isinstance(command, str):
-        return CommandError(code="INVALID_COMMAND", message="command must be a string")
+        raise _Rejected("INVALID_COMMAND", "command must be a string")
     if not command.strip():
-        return CommandError(code="INVALID_COMMAND", message="command cannot be empty")
+        raise _Rejected("INVALID_COMMAND", "command cannot be empty")
     if any(ord(character) < 32 or ord(character) == 127 for character in command):
-        return CommandError(
-            code="INVALID_COMMAND",
-            message="command must be a single line without control characters",
+        raise _Rejected(
+            "INVALID_COMMAND", "command must be a single line without control characters"
         )
     try:
         command_size = len(command.encode("utf-8"))
     except UnicodeEncodeError:
-        return CommandError(code="INVALID_COMMAND", message="command must be valid UTF-8")
+        raise _Rejected("INVALID_COMMAND", "command must be valid UTF-8") from None
     if command_size > MAX_COMMAND_BYTES:
-        return CommandError(
-            code="INVALID_COMMAND",
-            message=f"command exceeds the {MAX_COMMAND_BYTES}-byte limit",
-        )
-    return None
+        raise _Rejected("INVALID_COMMAND", f"command exceeds the {MAX_COMMAND_BYTES}-byte limit")
 
 
-def _failed_before_dispatch(
+def _result(
     device: object,
-    error: CommandError,
+    status: CommandStatus,
     started: int,
+    *,
+    output: str = "",
+    output_truncated: bool = False,
+    error: CommandError | None = None,
 ) -> CommandResult:
     return CommandResult(
         device=device if isinstance(device, str) else str(device),
-        status=CommandStatus.FAILED,
-        execution_state=ExecutionState.NOT_STARTED,
-        duration_ms=_elapsed_ms(started),
+        status=status,
+        output=output,
+        output_truncated=output_truncated,
+        duration_ms=max(0, (time.perf_counter_ns() - started) // 1_000_000),
         error=error,
     )
-
-
-def _map_execution(
-    device: str,
-    execution: SSHExecution,
-    started: int,
-) -> CommandResult:
-    common = {
-        "device": device,
-        "exit_code": execution.exit_code,
-        "stdout": execution.stdout,
-        "stderr": execution.stderr,
-        "stdout_truncated": execution.stdout_truncated,
-        "stderr_truncated": execution.stderr_truncated,
-        "duration_ms": _elapsed_ms(started),
-    }
-
-    if execution.status == "succeeded":
-        return CommandResult(
-            **common,
-            status=CommandStatus.SUCCEEDED,
-            execution_state=ExecutionState.COMPLETED,
-        )
-
-    if execution.status == "failed":
-        return CommandResult(
-            **common,
-            status=CommandStatus.FAILED,
-            execution_state=ExecutionState.COMPLETED,
-            error=CommandError(
-                code=execution.error_code or "REMOTE_COMMAND_FAILED",
-                message=execution.error_message or "Remote command exited with a non-zero status",
-            ),
-        )
-
-    return CommandResult(
-        **common,
-        status=CommandStatus.UNKNOWN,
-        execution_state=ExecutionState.UNKNOWN,
-        error=CommandError(
-            code=execution.error_code or "EXECUTION_OUTCOME_UNKNOWN",
-            message=execution.error_message or "Command execution outcome is unknown",
-            retryable=False,
-            may_have_executed=True,
-        ),
-    )
-
-
-def _elapsed_ms(started: int) -> int:
-    return max(0, (time.perf_counter_ns() - started) // 1_000_000)
