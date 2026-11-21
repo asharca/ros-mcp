@@ -22,10 +22,10 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
 
     steps:
+      # Full history and tags; the notes script reads the range ending at $TAG.
       - name: Check out repository
         uses: actions/checkout@v7.0.0
         with:
-          ref: refs/tags/${{ env.TAG }}
           fetch-depth: 0
 
       - name: Write release notes
