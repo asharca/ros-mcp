@@ -208,6 +208,10 @@ docker pull ghcr.io/asharca/ros-mcp:latest
 `main` publishes `latest`, `main`, and `sha-<commit>` tags. Git tags such as
 `v1.2.3` additionally publish `1.2.3` and `1.2`.
 
+Pushing a `v*` tag also creates a GitHub Release. Its notes list each commit
+since the previous `v*` tag and every `BREAKING CHANGE:` footer, so describe
+incompatible changes and their migration in that footer.
+
 To build locally:
 
 ```bash
